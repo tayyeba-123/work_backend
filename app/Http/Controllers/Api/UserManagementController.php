@@ -4,73 +4,79 @@ namespace App\Http\Controllers\Api;
 
 use App\Http\Controllers\Controller;
 use App\Models\User;
-use App\Services\NotificationService;
+use App\Models\Task;
 use Illuminate\Http\Request;
-use Illuminate\Validation\Rule;
-use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\DB;
 
 class UserManagementController extends Controller
 {
-    protected $notificationService;
-
-    public function __construct(NotificationService $notificationService = null)
-    {
-        // Make NotificationService optional to prevent errors if it doesn't exist
-        $this->notificationService = $notificationService;
-    }
-   
-
     public function index(Request $request)
     {
         try {
-            $query = User::with(['assignedTasks']);
+            $users = User::with(['createdTasks', 'assignedTasks'])->get();
             
-            // Apply filters
-            if ($request->has('role') && $request->role !== 'all') {
-                $query->where('role', $request->role);
-            }
-            
-            if ($request->has('status') && $request->status !== 'all') {
-                $query->where('status', $request->status);
-            }
-            
-            // Search
-            if ($request->has('search')) {
-                $search = $request->search;
-                $query->where(function ($q) use ($search) {
-                    $q->where('name', 'like', "%{$search}%")
-                      ->orWhere('email', 'like', "%{$search}%")
-                      ->orWhere('department', 'like', "%{$search}%");
-                });
-            }
-            
-            // Exclude current admin from regular listing
-            if ($request->get('exclude_admins', true)) {
-                $query->where('role', '!=', 'admin');
-            }
-            
-            // Sorting
-            $sortBy = $request->get('sort_by', 'created_at');
-            $sortOrder = $request->get('sort_order', 'desc');
-            $query->orderBy($sortBy, $sortOrder);
-            
-            // Pagination
-            $perPage = $request->get('per_page', 15);
-            $users = $query->paginate($perPage);
-            
-            // Transform the data
-            $users->getCollection()->transform(function ($user) {
-                return $this->formatUserResponse($user);
+            $formattedUsers = $users->map(function ($user) {
+                // Get active tasks (not completed)
+                $activeTasks = Task::whereHas('assignees', function($q) use ($user) {
+                    $q->where('user_id', $user->id);
+                })->whereNotIn('status', ['Completed'])->count();
+                
+                $completedTasks = Task::whereHas('assignees', function($q) use ($user) {
+                    $q->where('user_id', $user->id);
+                })->where('status', 'Completed')->count();
+                
+                // Check if user is a pair programmer on any active tasks
+                $pairTasks = Task::where('pair_programmer_id', $user->id)
+                    ->whereNotIn('status', ['Completed'])
+                    ->with(['assignees'])
+                    ->get();
+                
+                $pairedWith = null;
+                if ($pairTasks->count() > 0) {
+                    // Get the names of people this user is paired with
+                    $pairedNames = [];
+                    foreach ($pairTasks as $task) {
+                        foreach ($task->assignees as $assignee) {
+                            if ($assignee->id !== $user->id) {
+                                $pairedNames[] = $assignee->name;
+                            }
+                        }
+                    }
+                    $pairedWith = implode(', ', array_unique($pairedNames));
+                }
+                
+                // Also check if user is assigned to tasks where they're not the pair programmer
+                $assignedPairTasks = Task::whereHas('assignees', function($q) use ($user) {
+                    $q->where('user_id', $user->id);
+                })
+                ->whereNotNull('pair_programmer_id')
+                ->where('pair_programmer_id', '!=', $user->id)
+                ->whereNotIn('status', ['Completed'])
+                ->with(['pairProgrammer'])
+                ->get();
+                
+                if ($assignedPairTasks->count() > 0 && !$pairedWith) {
+                    $pairProgrammers = $assignedPairTasks->pluck('pairProgrammer.name')->unique()->toArray();
+                    $pairedWith = implode(', ', $pairProgrammers);
+                }
+                
+                return [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'role' => $user->role ?? 'user',
+                    'department' => $user->department,
+                    'active_tasks_count' => $activeTasks,
+                    'completed_tasks_count' => $completedTasks,
+                    'pair_tasks_count' => $pairTasks->count() + $assignedPairTasks->count(),
+                    'paired_with' => $pairedWith,
+                    'created_at' => $user->created_at,
+                    'updated_at' => $user->updated_at
+                ];
             });
             
             return response()->json([
                 'success' => true,
-                'data' => $users,
-                'filters' => [
-                    'roles' => User::getRoles(),
-                    'statuses' => User::getStatuses()
-                ]
+                'data' => $formattedUsers
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -80,7 +86,8 @@ class UserManagementController extends Controller
             ], 500);
         }
     }
-
+    
+  
     public function store(Request $request)
     {
         $request->validate([

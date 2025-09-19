@@ -10,21 +10,13 @@ use Illuminate\Support\Facades\Validator;
 
 class TaskController extends Controller
 {
-    // NO CONSTRUCTOR - This is the key fix!
-    // Remove any constructor that calls $this->middleware()
-    
     public function index(Request $request)
     {
         try {
             $query = Task::query();
             
-            // Add relationships if Task model has them
-            if (method_exists(Task::class, 'creator')) {
-                $query->with(['creator']);
-            }
-            if (method_exists(Task::class, 'assignees')) {
-                $query->with(['assignees']);
-            }
+            // Load all relationships including pair programmer
+            $query->with(['creator', 'assignees', 'pairProgrammer']);
             
             // Apply filters
             if ($request->has('status') && $request->status !== 'all') {
@@ -32,66 +24,58 @@ class TaskController extends Controller
             }
             
             if ($request->has('assignee') && $request->assignee !== 'all') {
-                if (method_exists(Task::class, 'assignees')) {
-                    $query->whereHas('assignees', function($q) use ($request) {
-                        $q->where('user_id', $request->assignee);
-                    });
-                }
+                $query->whereHas('assignees', function($q) use ($request) {
+                    $q->where('user_id', $request->assignee);
+                });
             }
             
             if ($request->has('search') && !empty($request->search)) {
                 $query->where(function($q) use ($request) {
-                    $q->where('title', 'like', '%' . $request->search . '%');
-                    if (method_exists(Task::class, 'description')) {
-                        $q->orWhere('description', 'like', '%' . $request->search . '%');
-                    }
+                    $q->where('title', 'like', '%' . $request->search . '%')
+                      ->orWhere('description', 'like', '%' . $request->search . '%');
                 });
             }
             
-            $tasks = $query->orderBy('created_at', 'desc')
-                          ->paginate($request->get('per_page', 10));
+            $tasks = $query->orderBy('created_at', 'desc')->get();
             
             $formattedTasks = $tasks->map(function ($task) {
                 $taskData = [
                     'id' => $task->id,
                     'title' => $task->title,
-                    'status' => $task->status ?? 'new',
-                    'created_at' => $task->created_at ? $task->created_at->format('M j, Y') : null,
-                    'updated_at' => $task->updated_at ? $task->updated_at->diffForHumans() : null
+                    'description' => $task->description,
+                    'status' => $task->status,
+                    'priority' => $task->priority,
+                    'due_date' => $task->due_date ? $task->due_date->format('Y-m-d') : null,
+                    'time_estimate' => $task->time_estimate,
+                    'pair_programmer_id' => $task->pair_programmer_id,
+                    'created_at' => $task->created_at,
+                    'updated_at' => $task->updated_at,
+                    'is_overdue' => $task->due_date && $task->due_date->isPast() && $task->status !== 'Completed'
                 ];
                 
-                // Add optional fields if they exist
-                if (isset($task->description)) {
-                    $taskData['description'] = $task->description;
-                }
-                if (isset($task->priority)) {
-                    $taskData['priority'] = $task->priority;
-                }
-                if (isset($task->due_date)) {
-                    $taskData['due_date'] = $task->due_date ? $task->due_date->format('Y-m-d') : null;
-                }
-                if (isset($task->is_overdue)) {
-                    $taskData['is_overdue'] = $task->is_overdue;
-                }
-                
-                // Add creator info if relationship exists
-                if ($task->relationLoaded('creator') && $task->creator) {
+                // Add creator info
+                if ($task->creator) {
                     $taskData['created_by'] = $task->creator->name;
-                } else {
-                    $taskData['created_by'] = 'Unknown';
                 }
                 
-                // Add assignees if relationship exists
-                if ($task->relationLoaded('assignees')) {
-                    $taskData['assignees'] = $task->assignees->map(function($user) {
-                        return [
-                            'id' => $user->id,
-                            'name' => $user->name,
-                            'email' => $user->email ?? ''
-                        ];
-                    });
+                // Add assignees
+                $taskData['assignees'] = $task->assignees->map(function($user) {
+                    return [
+                        'id' => $user->id,
+                        'name' => $user->name,
+                        'email' => $user->email
+                    ];
+                });
+                
+                // Add pair programmer info
+                if ($task->pairProgrammer) {
+                    $taskData['pair_programmer'] = [
+                        'id' => $task->pairProgrammer->id,
+                        'name' => $task->pairProgrammer->name,
+                        'email' => $task->pairProgrammer->email
+                    ];
                 } else {
-                    $taskData['assignees'] = [];
+                    $taskData['pair_programmer'] = null;
                 }
                 
                 return $taskData;
@@ -99,13 +83,7 @@ class TaskController extends Controller
             
             return response()->json([
                 'success' => true,
-                'data' => $formattedTasks,
-                'pagination' => [
-                    'current_page' => $tasks->currentPage(),
-                    'total_pages' => $tasks->lastPage(),
-                    'per_page' => $tasks->perPage(),
-                    'total' => $tasks->total()
-                ]
+                'data' => $formattedTasks
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -123,9 +101,11 @@ class TaskController extends Controller
                 'title' => 'required|string|max:255',
                 'description' => 'nullable|string',
                 'due_date' => 'nullable|date',
-                'priority' => 'nullable|string',
+                'priority' => 'nullable|in:Low,Medium,High,Critical',
+                'time_estimate' => 'nullable|numeric|min:0.5',
                 'assignees' => 'nullable|array',
-                'assignees.*' => 'integer'
+                'assignees.*' => 'integer|exists:users,id',
+                'pair_programmer_id' => 'nullable|integer|exists:users,id'
             ]);
             
             if ($validator->fails()) {
@@ -136,50 +116,32 @@ class TaskController extends Controller
                 ], 422);
             }
             
-            // Create task with basic required fields
+            // Create task
             $taskData = [
                 'title' => $request->title,
-                'status' => 'new'
+                'description' => $request->description,
+                'status' => 'New',
+                'priority' => $request->priority ?? 'Medium',
+                'due_date' => $request->due_date,
+                'time_estimate' => $request->time_estimate,
+                'pair_programmer_id' => $request->pair_programmer_id, // This is the key field!
+                'created_by' => auth()->id()
             ];
-            
-            // Add optional fields if provided
-            if ($request->has('description')) {
-                $taskData['description'] = $request->description;
-            }
-            if ($request->has('due_date')) {
-                $taskData['due_date'] = $request->due_date;
-            }
-            if ($request->has('priority')) {
-                $taskData['priority'] = $request->priority;
-            }
-            if (auth()->check()) {
-                $taskData['created_by'] = auth()->id();
-            }
             
             $task = Task::create($taskData);
             
-            // Attach assignees if provided and relationship exists
-            if ($request->has('assignees') && is_array($request->assignees) && method_exists($task, 'assignees')) {
+            // Attach assignees if provided
+            if ($request->has('assignees') && is_array($request->assignees)) {
                 $task->assignees()->attach($request->assignees);
             }
             
             // Load relationships for response
-            if (method_exists($task, 'creator')) {
-                $task->load('creator');
-            }
-            if (method_exists($task, 'assignees')) {
-                $task->load('assignees');
-            }
+            $task->load(['creator', 'assignees', 'pairProgrammer']);
             
             return response()->json([
                 'success' => true,
                 'message' => 'Task created successfully',
-                'data' => [
-                    'id' => $task->id,
-                    'title' => $task->title,
-                    'status' => $task->status,
-                    'created_at' => $task->created_at->format('M j, Y')
-                ]
+                'data' => $task
             ], 201);
         } catch (\Exception $e) {
             return response()->json([
@@ -193,46 +155,37 @@ class TaskController extends Controller
     public function show($id)
     {
         try {
-            $query = Task::where('id', $id);
-            
-            // Add relationships if they exist
-            if (method_exists(Task::class, 'creator')) {
-                $query->with('creator');
-            }
-            if (method_exists(Task::class, 'assignees')) {
-                $query->with('assignees');
-            }
-            
-            $task = $query->firstOrFail();
+            $task = Task::with(['creator', 'assignees', 'pairProgrammer'])->findOrFail($id);
             
             $taskData = [
                 'id' => $task->id,
                 'title' => $task->title,
+                'description' => $task->description,
                 'status' => $task->status,
+                'priority' => $task->priority,
+                'due_date' => $task->due_date ? $task->due_date->format('Y-m-d') : null,
+                'time_estimate' => $task->time_estimate,
+                'pair_programmer_id' => $task->pair_programmer_id,
                 'created_at' => $task->created_at,
                 'updated_at' => $task->updated_at
             ];
             
-            // Add optional fields
-            if (isset($task->description)) $taskData['description'] = $task->description;
-            if (isset($task->priority)) $taskData['priority'] = $task->priority;
-            if (isset($task->due_date)) $taskData['due_date'] = $task->due_date;
-            if (isset($task->is_overdue)) $taskData['is_overdue'] = $task->is_overdue;
+            // Add assignees
+            $taskData['assignees'] = $task->assignees->map(function($user) {
+                return [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email
+                ];
+            });
             
-            // Add creator if loaded
-            if ($task->relationLoaded('creator') && $task->creator) {
-                $taskData['created_by'] = $task->creator->name;
-            }
-            
-            // Add assignees if loaded
-            if ($task->relationLoaded('assignees')) {
-                $taskData['assignees'] = $task->assignees->map(function($user) {
-                    return [
-                        'id' => $user->id,
-                        'name' => $user->name,
-                        'email' => $user->email ?? ''
-                    ];
-                });
+            // Add pair programmer
+            if ($task->pairProgrammer) {
+                $taskData['pair_programmer'] = [
+                    'id' => $task->pairProgrammer->id,
+                    'name' => $task->pairProgrammer->name,
+                    'email' => $task->pairProgrammer->email
+                ];
             }
             
             return response()->json([
@@ -256,11 +209,13 @@ class TaskController extends Controller
             $validator = Validator::make($request->all(), [
                 'title' => 'sometimes|required|string|max:255',
                 'description' => 'nullable|string',
-                'status' => 'sometimes|required|string',
+                'status' => 'sometimes|required|in:New,Open,In Progress,Completed',
+                'priority' => 'nullable|in:Low,Medium,High,Critical',
                 'due_date' => 'nullable|date',
-                'priority' => 'nullable|string',
+                'time_estimate' => 'nullable|numeric|min:0.5',
                 'assignees' => 'nullable|array',
-                'assignees.*' => 'integer'
+                'assignees.*' => 'integer|exists:users,id',
+                'pair_programmer_id' => 'nullable|integer|exists:users,id'
             ]);
             
             if ($validator->fails()) {
@@ -271,32 +226,25 @@ class TaskController extends Controller
                 ], 422);
             }
             
-            // Update only provided fields
-            $updateData = [];
-            if ($request->has('title')) $updateData['title'] = $request->title;
-            if ($request->has('description')) $updateData['description'] = $request->description;
-            if ($request->has('status')) $updateData['status'] = $request->status;
-            if ($request->has('due_date')) $updateData['due_date'] = $request->due_date;
-            if ($request->has('priority')) $updateData['priority'] = $request->priority;
+            // Update task fields
+            $updateData = $request->only([
+                'title', 'description', 'status', 'priority', 
+                'due_date', 'time_estimate', 'pair_programmer_id'
+            ]);
             
-            if (!empty($updateData)) {
-                $task->update($updateData);
-            }
+            $task->update($updateData);
             
-            // Update assignees if provided and relationship exists
-            if ($request->has('assignees') && method_exists($task, 'assignees')) {
+            // Update assignees if provided
+            if ($request->has('assignees')) {
                 $task->assignees()->sync($request->assignees);
             }
+            
+            $task->load(['creator', 'assignees', 'pairProgrammer']);
             
             return response()->json([
                 'success' => true,
                 'message' => 'Task updated successfully',
-                'data' => [
-                    'id' => $task->id,
-                    'title' => $task->title,
-                    'status' => $task->status,
-                    'updated_at' => $task->updated_at->diffForHumans()
-                ]
+                'data' => $task
             ]);
         } catch (\Exception $e) {
             return response()->json([
@@ -307,6 +255,7 @@ class TaskController extends Controller
         }
     }
     
+   
     public function destroy($id)
     {
         try {

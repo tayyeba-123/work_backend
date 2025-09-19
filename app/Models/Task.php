@@ -15,11 +15,14 @@ class Task extends Model
         'status',
         'due_date',
         'created_by',
-        'priority'
+        'priority',
+        'time_estimate',        // Added
+        'pair_programmer_id'    // Added - this is the key missing field
     ];
 
     protected $casts = [
         'due_date' => 'date',
+        'time_estimate' => 'decimal:2'  // Added
     ];
 
     const STATUS_NEW = 'New';
@@ -48,6 +51,12 @@ class Task extends Model
         return $this->belongsToMany(User::class, 'task_assignees', 'task_id', 'user_id');
     }
 
+    // Added this relationship - this is what was missing!
+    public function pairProgrammer()
+    {
+        return $this->belongsTo(User::class, 'pair_programmer_id');
+    }
+
     public function comments()
     {
         return $this->hasMany(TaskComment::class);
@@ -72,6 +81,12 @@ class Task extends Model
         });
     }
 
+    // Added scope for pair programming tasks
+    public function scopeForPairProgrammer($query, $userId)
+    {
+        return $query->where('pair_programmer_id', $userId);
+    }
+
     // Accessors
     public function getIsOverdueAttribute()
     {
@@ -83,5 +98,11 @@ class Task extends Model
     public function getAssigneeNamesAttribute()
     {
         return $this->assignees->pluck('name')->toArray();
+    }
+
+    // Added accessor for pair programmer name
+    public function getPairProgrammerNameAttribute()
+    {
+        return $this->pairProgrammer ? $this->pairProgrammer->name : null;
     }
 }
